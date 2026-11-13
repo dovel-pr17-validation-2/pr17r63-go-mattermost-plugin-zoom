@@ -1,0 +1,38 @@
+dist
+# Binaries for programs and plugins
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Build
+/coverage.txt
+/plugin.exe
+/mattermost-zoom-plugin*.tar.gz
+/dist
+server/vendor
+node_modules
+.npminstall
+webapp/dist
+bin
+
+# Manifest files
+webapp/src/manifest.ts
+server/manifest.go
+
+# Mac
+*.swp
+.DS_Store
+
+#IDEs
+/.idea
+/.vscode
+
+# notice
+.notice-work

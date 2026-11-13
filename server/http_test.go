@@ -1,0 +1,333 @@
+// Copyright (c) 2017-present Mattermost, Inc. All Rights Reserved.
+// See LICENSE.txt for license information.
+
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost/server/public/model"
+	"github.com/mattermost/mattermost/server/public/plugin"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest"
+	"github.com/mattermost/mattermost/server/public/plugin/plugintest/mock"
+)
+
+func TestSubmitFormPMIForMeeting(t *testing.T) {
+	for name, tc := range map[string]struct {
+		context      map[string]interface{}
+		headerUserID string
+		expectStatus int
+	}{
+		"missing action in context": {
+			context: map[string]interface{}{
+				userIDForContext:    "user1",
+				channelIDForContext: "channel1",
+			},
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+		"missing userID in context": {
+			context: map[string]interface{}{
+				actionForContext:    usePersonalMeetingID,
+				channelIDForContext: "channel1",
+			},
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+		"missing channelID in context": {
+			context: map[string]interface{}{
+				actionForContext: usePersonalMeetingID,
+				userIDForContext: "user1",
+			},
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+		"user ID mismatch": {
+			context: map[string]interface{}{
+				actionForContext:    usePersonalMeetingID,
+				userIDForContext:    "user1",
+				channelIDForContext: "channel1",
+			},
+			headerUserID: "different_user",
+			expectStatus: http.StatusBadRequest,
+		},
+		"invalid action type": {
+			context: map[string]interface{}{
+				actionForContext:    123,
+				userIDForContext:    "user1",
+				channelIDForContext: "channel1",
+			},
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+		"nil context": {
+			context:      nil,
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &plugintest.API{}
+			p := Plugin{}
+			p.SetAPI(api)
+
+			api.On("LogWarn", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+			api.On("LogWarn", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+
+			reqPayload := &model.PostActionIntegrationRequest{
+				Context: tc.context,
+			}
+			body, err := json.Marshal(reqPayload)
+			require.NoError(t, err)
+
+			request := httptest.NewRequest(http.MethodPost, "/submit-form-pmi-meeting", bytes.NewReader(body))
+			request.Header.Set("Mattermost-User-Id", tc.headerUserID)
+
+			rr := httptest.NewRecorder()
+			p.submitFormPMIForMeeting(rr, request)
+
+			assert.Equal(t, tc.expectStatus, rr.Code)
+		})
+	}
+}
+
+func TestSubmitFormPMIForPreference(t *testing.T) {
+	for name, tc := range map[string]struct {
+		context      map[string]interface{}
+		headerUserID string
+		expectStatus int
+	}{
+		"missing action in context": {
+			context:      map[string]interface{}{},
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+		"invalid action type": {
+			context: map[string]interface{}{
+				actionForContext: 123,
+			},
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+		"missing header user ID": {
+			context: map[string]interface{}{
+				actionForContext: yes,
+			},
+			headerUserID: "",
+			expectStatus: http.StatusUnauthorized,
+		},
+		"nil context": {
+			context:      nil,
+			headerUserID: "user1",
+			expectStatus: http.StatusBadRequest,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &plugintest.API{}
+			p := Plugin{}
+			p.SetAPI(api)
+
+			api.On("LogWarn", mock.Anything).Maybe().Return()
+			api.On("LogWarn", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+
+			reqPayload := &model.PostActionIntegrationRequest{
+				Context: tc.context,
+			}
+			body, err := json.Marshal(reqPayload)
+			require.NoError(t, err)
+
+			request := httptest.NewRequest(http.MethodPost, "/submit-form-pmi-preference", bytes.NewReader(body))
+			if tc.headerUserID != "" {
+				request.Header.Set(MattermostUserIDHeader, tc.headerUserID)
+			}
+
+			rr := httptest.NewRecorder()
+			p.submitFormPMIForPreference(rr, request)
+
+			assert.Equal(t, tc.expectStatus, rr.Code)
+		})
+	}
+}
+
+// panicAfterWriteWriter commits the response body, then panics so ServeHTTP's
+// recover path can be exercised after headers are already written.
+type panicAfterWriteWriter struct {
+	http.ResponseWriter
+	message string
+}
+
+func (w *panicAfterWriteWriter) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	if err != nil {
+		return n, err
+	}
+	panic(w.message)
+}
+
+func TestServeHTTPRecoversFromPanic(t *testing.T) {
+	validConfig := &configuration{
+		WebhookSecret:     "secret",
+		EncryptionKey:     "4Su-mLR7N6VwC6aXjYhQoT0shtS9fKz+",
+		OAuthClientID:     "clientid",
+		OAuthClientSecret: "clientsecret",
+	}
+
+	t.Run("panic before response is committed returns 500", func(t *testing.T) {
+		api := &plugintest.API{}
+		p := Plugin{}
+		p.SetAPI(api)
+		p.setConfiguration(validConfig)
+
+		api.On("GetLicense").Return(nil).Run(func(args mock.Arguments) {
+			panic("boom before write")
+		})
+		api.On("LogError", "Recovered from panic while serving HTTP request", "path", "/", "error", "boom before write").Once()
+
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+
+		require.NotPanics(t, func() {
+			p.ServeHTTP(&plugin.Context{}, rr, req)
+		})
+		assert.Equal(t, http.StatusInternalServerError, rr.Code)
+		assert.Contains(t, rr.Body.String(), "internal server error")
+		api.AssertExpectations(t)
+	})
+
+	t.Run("panic after response is committed leaves status untouched", func(t *testing.T) {
+		api := &plugintest.API{}
+		p := Plugin{}
+		p.SetAPI(api)
+		p.setConfiguration(validConfig)
+
+		api.On("GetLicense").Return(nil)
+		api.On("LogError", "Recovered from panic while serving HTTP request", "path", "/unknown", "error", "boom after write").Once()
+
+		rr := httptest.NewRecorder()
+		w := &panicAfterWriteWriter{ResponseWriter: rr, message: "boom after write"}
+		req := httptest.NewRequest(http.MethodGet, "/unknown", nil)
+
+		require.NotPanics(t, func() {
+			p.ServeHTTP(&plugin.Context{}, w, req)
+		})
+		assert.Equal(t, http.StatusNotFound, rr.Code)
+		assert.Contains(t, rr.Body.String(), "404 page not found")
+		assert.NotContains(t, rr.Body.String(), "internal server error")
+		api.AssertExpectations(t)
+	})
+}
+
+// A JSON `null` body decodes without error but leaves the target pointer nil.
+// These tests ensure the handlers return 400 instead of panicking and crashing
+// the plugin process (MM-69855).
+func TestHandlersRejectNullBody(t *testing.T) {
+	for name, handler := range map[string]func(p *Plugin, w http.ResponseWriter, r *http.Request){
+		"submitFormPMIForMeeting": func(p *Plugin, w http.ResponseWriter, r *http.Request) {
+			p.submitFormPMIForMeeting(w, r)
+		},
+		"submitFormPMIForPreference": func(p *Plugin, w http.ResponseWriter, r *http.Request) {
+			p.submitFormPMIForPreference(w, r)
+		},
+		"handleChannelPreference": func(p *Plugin, w http.ResponseWriter, r *http.Request) {
+			p.handleChannelPreference(w, r)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &plugintest.API{}
+			p := Plugin{}
+			p.SetAPI(api)
+
+			api.On("LogWarn", mock.Anything).Maybe().Return()
+			api.On("LogWarn", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+			api.On("LogError", mock.Anything).Maybe().Return()
+			api.On("LogError", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+
+			request := httptest.NewRequest(http.MethodPost, "/null-body", bytes.NewReader([]byte("null")))
+			request.Header.Set(MattermostUserIDHeader, "user1")
+
+			rr := httptest.NewRecorder()
+
+			require.NotPanics(t, func() {
+				handler(&p, rr, request)
+			})
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
+		})
+	}
+}
+
+func TestHandleChannelPreferenceAuth(t *testing.T) {
+	for name, tc := range map[string]struct {
+		headerUserID         string
+		payloadUserID        string
+		expectStatus         int
+		expectKVUpdate       bool
+		expectPermissionCall bool
+	}{
+		"success": {
+			headerUserID:         "admin",
+			payloadUserID:        "admin",
+			expectStatus:         http.StatusOK,
+			expectKVUpdate:       true,
+			expectPermissionCall: true,
+		},
+		"missing header": {
+			headerUserID:  "",
+			payloadUserID: "admin",
+			expectStatus:  http.StatusUnauthorized,
+		},
+		"mismatched user": {
+			headerUserID:  "user",
+			payloadUserID: "admin",
+			expectStatus:  http.StatusUnauthorized,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &plugintest.API{}
+			p := Plugin{}
+			p.SetAPI(api)
+
+			api.On("LogError", mock.Anything).Maybe().Return()
+			api.On("LogError", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+			api.On("LogWarn", mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+			api.On("LogWarn", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
+
+			if tc.expectPermissionCall {
+				api.On("HasPermissionTo", tc.payloadUserID, model.PermissionManageSystem).Return(true)
+			}
+
+			if tc.expectKVUpdate {
+				api.On("KVGet", zoomChannelSettings).Return([]byte{}, nil)
+				api.On("KVSet", zoomChannelSettings, mock.AnythingOfType("[]uint8")).Return(nil)
+			}
+
+			reqPayload := &model.SubmitDialogRequest{
+				UserId:    tc.payloadUserID,
+				ChannelId: "channel",
+				Submission: map[string]interface{}{
+					"preference": "allow",
+				},
+			}
+			body, err := json.Marshal(reqPayload)
+			require.NoError(t, err)
+
+			request := httptest.NewRequest(http.MethodPost, pathChannelPreference, bytes.NewReader(body))
+			if tc.headerUserID != "" {
+				request.Header.Set(MattermostUserIDHeader, tc.headerUserID)
+			}
+
+			rr := httptest.NewRecorder()
+
+			p.handleChannelPreference(rr, request)
+
+			assert.Equal(t, tc.expectStatus, rr.Code)
+			api.AssertExpectations(t)
+		})
+	}
+}
